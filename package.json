@@ -1,0 +1,20 @@
+{
+  "name": "minigt-preorder-backend",
+  "version": "1.0.0",
+  "description": "MINI GT Brunei Pre-Order Backend",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.3",
+    "lowdb": "^7.0.1",
+    "twilio": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
