@@ -1,9 +1,3 @@
-// ============================================================
-// MINI GT Brunei — Pre-Order Backend
-// Node.js + Express + LowDB (JSON file) + Twilio
-// No build tools required — works on all platforms
-// ============================================================
-
 import express from 'express';
 import cors from 'cors';
 import { Low } from 'lowdb';
@@ -45,14 +39,17 @@ const defaultData = {
     { id: 'p6', name: 'Subaru Impreza WRX STI',         scale: '1:64', price: 8.90, image: '', sort: 6 },
   ],
   orders: [],
-  smsCodes: {},
-  verifiedPhones: {},
+  customers: {},    // phone -> { name, address, registeredAt }
+  smsCodes: {},     // phone -> { code, expiresAt, purpose }
+  customerSessions: {}, // token -> phone
 };
 
 const adapter = new JSONFile(DB_PATH);
 const db = new Low(adapter, defaultData);
 await db.read();
 db.data = { ...defaultData, ...db.data };
+if (!db.data.customers) db.data.customers = {};
+if (!db.data.customerSessions) db.data.customerSessions = {};
 await db.write();
 
 let twilioClient = null;
@@ -63,13 +60,34 @@ if (CONFIG.TWILIO_SID && CONFIG.TWILIO_TOKEN) {
   console.log('⚠  Twilio not configured — demo mode (code: 123456)');
 }
 
-const sessions = new Set();
+// Admin auth
+const adminSessions = new Set();
 function requireAdmin(req, res, next) {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
-  if (!sessions.has(token)) return res.status(401).json({ error: 'Unauthorized' });
+  if (!adminSessions.has(token)) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
+// Customer auth middleware
+function requireCustomer(req, res, next) {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  const phone = db.data.customerSessions[token];
+  if (!phone) return res.status(401).json({ error: 'Not logged in' });
+  req.customerPhone = phone;
+  req.customer = db.data.customers[phone];
+  next();
+}
+
+async function sendSMS(phone, message) {
+  if (twilioClient) {
+    await twilioClient.messages.create({ body: message, from: CONFIG.TWILIO_FROM, to: phone });
+    return true;
+  }
+  console.log(`[DEMO SMS to ${phone}]: ${message}`);
+  return false;
+}
+
+// ── PUBLIC: Batch & Products ──────────────────────────────
 app.get('/api/batch', async (req, res) => {
   await db.read();
   if (db.data.batch.status === 'open' && db.data.batch.deadline && new Date(db.data.batch.deadline) < new Date()) {
@@ -79,76 +97,165 @@ app.get('/api/batch', async (req, res) => {
   res.json({ batch: db.data.batch, products: [...db.data.products].sort((a, b) => a.sort - b.sort) });
 });
 
-app.post('/api/send-code', async (req, res) => {
+// ── REGISTRATION: Send code ───────────────────────────────
+app.post('/api/auth/send-code', async (req, res) => {
   const phone = (req.body.phone || '').replace(/\s+/g, '');
+  const purpose = req.body.purpose || 'register'; // 'register' or 'login'
   if (!phone) return res.status(400).json({ error: 'Phone required' });
+
+  await db.read();
+
+  // If login but not registered
+  if (purpose === 'login' && !db.data.customers[phone]) {
+    return res.status(404).json({ error: 'No account found. Please register first.' });
+  }
+
   const code = Math.floor(100000 + Math.random() * 900000).toString();
-  db.data.smsCodes[phone] = { code, expiresAt: Date.now() + CONFIG.CODE_EXPIRY_MS };
+  db.data.smsCodes[phone] = { code, expiresAt: Date.now() + CONFIG.CODE_EXPIRY_MS, purpose };
   await db.write();
-  if (twilioClient) {
-    try {
-      await twilioClient.messages.create({
-        body: `Your MINI GT Brunei pre-order code is: ${code}. Valid for 10 minutes.`,
-        from: CONFIG.TWILIO_FROM,
-        to: phone,
-      });
-      res.json({ success: true });
-    } catch (err) {
-      console.error('Twilio error:', err.message);
-      res.status(500).json({ error: 'SMS failed. Check Twilio config.' });
-    }
-  } else {
-    console.log(`[DEMO] Code for ${phone}: ${code}`);
-    res.json({ success: true, demo: true });
+
+  const msg = purpose === 'login'
+    ? `Your MINI GT Brunei login code is: ${code}. Valid for 10 minutes.`
+    : `Your MINI GT Brunei registration code is: ${code}. Valid for 10 minutes.`;
+
+  try {
+    await sendSMS(phone, msg);
+    res.json({ success: true, demo: !twilioClient });
+  } catch (err) {
+    console.error('SMS error:', err.message);
+    res.status(500).json({ error: 'SMS failed' });
   }
 });
 
-app.post('/api/verify-code', async (req, res) => {
+// ── REGISTRATION: Verify code + create account ────────────
+app.post('/api/auth/register', async (req, res) => {
   const phone = (req.body.phone || '').replace(/\s+/g, '');
   const code  = (req.body.code  || '').trim();
+  const name  = (req.body.name  || '').trim();
+  const address = (req.body.address || '').trim();
+
+  if (!phone || !code || !name) return res.status(400).json({ error: 'Phone, code and name required' });
+
+  await db.read();
+
+  if (db.data.customers[phone]) return res.status(400).json({ error: 'Account already exists. Please login.' });
+
+  // Verify code
   if (!twilioClient && code === '123456') {
-    db.data.verifiedPhones[phone] = true;
-    await db.write();
-    return res.json({ verified: true });
-  }
-  const entry = db.data.smsCodes[phone];
-  if (!entry) return res.json({ verified: false, error: 'No code found — request a new one.' });
-  if (Date.now() > entry.expiresAt) {
+    // demo bypass
+  } else {
+    const entry = db.data.smsCodes[phone];
+    if (!entry) return res.json({ verified: false, error: 'No code found — request a new one.' });
+    if (Date.now() > entry.expiresAt) {
+      delete db.data.smsCodes[phone];
+      await db.write();
+      return res.json({ verified: false, error: 'Code expired.' });
+    }
+    if (entry.code !== code) return res.json({ verified: false, error: 'Incorrect code.' });
     delete db.data.smsCodes[phone];
-    await db.write();
-    return res.json({ verified: false, error: 'Code expired — request a new one.' });
   }
-  if (entry.code !== code) return res.json({ verified: false });
-  db.data.verifiedPhones[phone] = true;
-  delete db.data.smsCodes[phone];
+
+  // Create customer
+  db.data.customers[phone] = { name, phone, address, registeredAt: new Date().toISOString() };
+
+  // Create session
+  const token = crypto.randomBytes(32).toString('hex');
+  db.data.customerSessions[token] = phone;
   await db.write();
-  res.json({ verified: true });
+
+  console.log(`New customer: ${name} (${phone})`);
+  res.json({ success: true, token, customer: { name, phone, address } });
 });
 
-app.post('/api/orders', async (req, res) => {
+// ── LOGIN: Verify code ────────────────────────────────────
+app.post('/api/auth/login', async (req, res) => {
+  const phone = (req.body.phone || '').replace(/\s+/g, '');
+  const code  = (req.body.code  || '').trim();
+
+  if (!phone || !code) return res.status(400).json({ error: 'Phone and code required' });
+
   await db.read();
-  const { name, phone, address, items } = req.body;
-  if (!name || !phone || !items?.length) return res.status(400).json({ error: 'Missing fields' });
-  if (db.data.batch.status !== 'open') return res.status(400).json({ error: 'Pre-order is closed' });
-  if (!db.data.verifiedPhones[phone]) return res.status(400).json({ error: 'Phone not verified' });
-  if (db.data.orders.find(o => o.phone === phone)) return res.status(400).json({ error: 'Order already exists for this number' });
-  const ref = 'MGT-' + Date.now().toString().slice(-6);
-  db.data.orders.push({ ref, name, phone, address: address || '', items, verified: true, createdAt: new Date().toISOString() });
+
+  if (!db.data.customers[phone]) return res.status(404).json({ error: 'Account not found.' });
+
+  // Verify code
+  if (!twilioClient && code === '123456') {
+    // demo bypass
+  } else {
+    const entry = db.data.smsCodes[phone];
+    if (!entry) return res.json({ verified: false, error: 'No code found.' });
+    if (Date.now() > entry.expiresAt) {
+      delete db.data.smsCodes[phone];
+      await db.write();
+      return res.json({ verified: false, error: 'Code expired.' });
+    }
+    if (entry.code !== code) return res.json({ verified: false, error: 'Incorrect code.' });
+    delete db.data.smsCodes[phone];
+  }
+
+  const token = crypto.randomBytes(32).toString('hex');
+  db.data.customerSessions[token] = phone;
   await db.write();
-  console.log(`New order: ${ref} — ${name} (${phone})`);
+
+  const customer = db.data.customers[phone];
+  res.json({ success: true, token, customer: { name: customer.name, phone: customer.phone, address: customer.address } });
+});
+
+// ── LOGOUT ────────────────────────────────────────────────
+app.post('/api/auth/logout', async (req, res) => {
+  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  delete db.data.customerSessions[token];
+  await db.write();
+  res.json({ success: true });
+});
+
+// ── GET current customer ──────────────────────────────────
+app.get('/api/auth/me', requireCustomer, (req, res) => {
+  res.json({ customer: { name: req.customer.name, phone: req.customerPhone, address: req.customer.address } });
+});
+
+// ── SUBMIT ORDER (requires login) ─────────────────────────
+app.post('/api/orders', requireCustomer, async (req, res) => {
+  await db.read();
+  const { items } = req.body;
+  const phone = req.customerPhone;
+  const customer = req.customer;
+
+  if (!items?.length) return res.status(400).json({ error: 'No items selected' });
+  if (db.data.batch.status !== 'open') return res.status(400).json({ error: 'Pre-order is closed' });
+  if (db.data.orders.find(o => o.phone === phone)) return res.status(400).json({ error: 'You have already placed an order for this batch.' });
+
+  // Validate quantities
+  for (const item of items) {
+    if (!item.qty || item.qty < 1) return res.status(400).json({ error: 'Invalid quantity' });
+  }
+
+  const ref = 'MGT-' + Date.now().toString().slice(-6);
+  db.data.orders.push({
+    ref, name: customer.name, phone, address: customer.address || '',
+    items, verified: true, createdAt: new Date().toISOString()
+  });
+  await db.write();
+  console.log(`New order: ${ref} — ${customer.name} (${phone})`);
   res.json({ success: true, ref });
 });
 
+// ── ADMIN ─────────────────────────────────────────────────
 app.post('/api/admin/login', (req, res) => {
   if (req.body.password !== CONFIG.ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password' });
   const token = crypto.randomBytes(32).toString('hex');
-  sessions.add(token);
+  adminSessions.add(token);
   res.json({ token });
 });
 
 app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   await db.read();
   res.json({ orders: db.data.orders });
+});
+
+app.get('/api/admin/customers', requireAdmin, async (req, res) => {
+  await db.read();
+  res.json({ customers: Object.values(db.data.customers) });
 });
 
 app.put('/api/admin/batch', requireAdmin, async (req, res) => {
