@@ -8,6 +8,8 @@ import cors from 'cors';
 import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
 import crypto from 'crypto';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -21,6 +23,7 @@ const CONFIG = {
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'admin123',
   D7_TOKEN:       process.env.D7_API_TOKEN || '',
   D7_ORIGINATOR:  process.env.D7_ORIGINATOR || 'MINIGT',
+  D7_CHANNEL:     process.env.D7_CHANNEL || 'sms', // 'sms' or 'whatsapp'
   CODE_EXPIRY:    600, // seconds (10 minutes)
 };
 
@@ -31,6 +34,23 @@ const D7_OTP_URL = 'https://api.d7networks.com/verify/v1';
 // D7 sends the code AND verifies it — we just store the otp_id they return
 
 async function d7SendOTP(phone) {
+  const channel = CONFIG.D7_CHANNEL; // 'sms' or 'whatsapp'
+  const body = channel === 'whatsapp'
+    ? {
+        originator: CONFIG.D7_ORIGINATOR,
+        recipient: phone,
+        content: 'Your MINI GT Brunei verification code is: {}. Valid for 10 minutes.',
+        expiry: CONFIG.CODE_EXPIRY,
+        channel: 'whatsapp',
+      }
+    : {
+        originator: CONFIG.D7_ORIGINATOR,
+        recipient: phone,
+        content: 'Your MINI GT Brunei verification code is: {}. Valid for 10 minutes.',
+        expiry: CONFIG.CODE_EXPIRY,
+        data_coding: 'text',
+      };
+
   const res = await fetch(`${D7_OTP_URL}/otp/send-otp`, {
     method: 'POST',
     headers: {
@@ -38,13 +58,7 @@ async function d7SendOTP(phone) {
       'Accept': 'application/json',
       'Authorization': `Bearer ${CONFIG.D7_TOKEN}`,
     },
-    body: JSON.stringify({
-      originator: CONFIG.D7_ORIGINATOR,
-      recipient: phone,
-      content: 'Your MINI GT Brunei verification code is: {}. Valid for 10 minutes.',
-      expiry: CONFIG.CODE_EXPIRY,
-      data_coding: 'text',
-    }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -67,6 +81,23 @@ async function d7VerifyOTP(otpId, code) {
   if (!res.ok) return false;
   const data = await res.json();
   return data.status === 'approved';
+}
+
+
+// ── FIREBASE ADMIN ────────────────────────────────────────
+// Verifies Firebase ID tokens from the frontend
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'minigt-brunei';
+
+async function verifyFirebaseToken(idToken) {
+  // Verify token using Firebase's public key endpoint
+  const res = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${process.env.FIREBASE_API_KEY || 'AIzaSyCcpBE8U_SxKg8mRSG7X3VN_u-YJFVms1Q'}`,
+    { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ idToken }) }
+  );
+  if (!res.ok) throw new Error('Invalid Firebase token');
+  const data = await res.json();
+  if (!data.users || !data.users[0]) throw new Error('User not found');
+  return data.users[0]; // contains phoneNumber, localId etc
 }
 
 // ── DATABASE ──────────────────────────────────────────────
@@ -276,6 +307,51 @@ app.post('/api/orders', requireCustomer, async (req, res) => {
   await db.write();
   console.log(`New order: ${ref} — ${customer.name} (${phone})`);
   res.json({ success: true, ref });
+});
+
+// ── AUTH: FIREBASE LOGIN (phone verified by Firebase) ────
+app.post('/api/auth/firebase-login', async (req, res) => {
+  const { idToken, phone } = req.body;
+  if (!idToken || !phone) return res.status(400).json({ error: 'Missing token or phone' });
+
+  try {
+    await verifyFirebaseToken(idToken);
+  } catch(e) {
+    return res.status(401).json({ error: 'Invalid Firebase token' });
+  }
+
+  await db.read();
+  const customer = db.data.customers[phone];
+  if (!customer) return res.status(404).json({ error: 'No account found. Please register first.' });
+
+  const token = crypto.randomBytes(32).toString('hex');
+  db.data.customerSessions[token] = phone;
+  await db.write();
+
+  res.json({ success: true, token, customer: { name: customer.name, phone: customer.phone, address: customer.address } });
+});
+
+// ── AUTH: FIREBASE REGISTER (phone verified by Firebase) ─
+app.post('/api/auth/firebase-register', async (req, res) => {
+  const { idToken, phone, name, address } = req.body;
+  if (!idToken || !phone || !name) return res.status(400).json({ error: 'Missing required fields' });
+
+  try {
+    await verifyFirebaseToken(idToken);
+  } catch(e) {
+    return res.status(401).json({ error: 'Invalid Firebase token' });
+  }
+
+  await db.read();
+  if (db.data.customers[phone]) return res.status(400).json({ error: 'Account already exists. Please login.' });
+
+  db.data.customers[phone] = { name, phone, address: address || '', registeredAt: new Date().toISOString() };
+  const token = crypto.randomBytes(32).toString('hex');
+  db.data.customerSessions[token] = phone;
+  await db.write();
+
+  console.log(`New customer (Firebase): ${name} (${phone})`);
+  res.json({ success: true, token, customer: { name, phone, address: address || '' } });
 });
 
 // ── ADMIN ─────────────────────────────────────────────────
