@@ -1,8 +1,12 @@
+// ============================================================
+// MINI GT Brunei — Backend with D7 Networks OTP API
+// D7 handles code generation + verification natively
+// ============================================================
+
 import express from 'express';
 import cors from 'cors';
 import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
-import twilio from 'twilio';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -15,12 +19,57 @@ app.use(cors());
 const CONFIG = {
   PORT:           process.env.PORT || 3000,
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'admin123',
-  TWILIO_SID:     process.env.TWILIO_ACCOUNT_SID || '',
-  TWILIO_TOKEN:   process.env.TWILIO_AUTH_TOKEN || '',
-  TWILIO_FROM:    process.env.TWILIO_PHONE_NUMBER || '',
-  CODE_EXPIRY_MS: 10 * 60 * 1000,
+  D7_TOKEN:       process.env.D7_API_TOKEN || '',
+  D7_ORIGINATOR:  process.env.D7_ORIGINATOR || 'MINIGT',
+  CODE_EXPIRY:    600, // seconds (10 minutes)
 };
 
+// D7 OTP API base URL
+const D7_OTP_URL = 'https://api.d7networks.com/verify/v1';
+
+// ── D7 OTP HELPERS ────────────────────────────────────────
+// D7 sends the code AND verifies it — we just store the otp_id they return
+
+async function d7SendOTP(phone) {
+  const res = await fetch(`${D7_OTP_URL}/otp/send-otp`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${CONFIG.D7_TOKEN}`,
+    },
+    body: JSON.stringify({
+      originator: CONFIG.D7_ORIGINATOR,
+      recipient: phone,
+      content: 'Your MINI GT Brunei verification code is: {}. Valid for 10 minutes.',
+      expiry: CONFIG.CODE_EXPIRY,
+      data_coding: 'text',
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.detail || `D7 error ${res.status}`);
+  }
+  const data = await res.json();
+  return data.otp_id; // D7 returns an otp_id we use to verify later
+}
+
+async function d7VerifyOTP(otpId, code) {
+  const res = await fetch(`${D7_OTP_URL}/otp/verify-otp`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${CONFIG.D7_TOKEN}`,
+    },
+    body: JSON.stringify({ otp_id: otpId, otp_code: code }),
+  });
+  if (!res.ok) return false;
+  const data = await res.json();
+  return data.status === 'approved';
+}
+
+// ── DATABASE ──────────────────────────────────────────────
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'db.json');
 
 const defaultData = {
@@ -28,7 +77,7 @@ const defaultData = {
     title: 'Batch #12 — May 2025',
     desc: 'Select your models and place your pre-order before the deadline.',
     deadline: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
-    status: 'open'
+    status: 'open',
   },
   products: [
     { id: 'p1', name: 'Nissan Skyline GT-R R34 V-Spec', scale: '1:64', price: 8.90, image: '', sort: 1 },
@@ -39,8 +88,8 @@ const defaultData = {
     { id: 'p6', name: 'Subaru Impreza WRX STI',         scale: '1:64', price: 8.90, image: '', sort: 6 },
   ],
   orders: [],
-  customers: {},    // phone -> { name, address, registeredAt }
-  smsCodes: {},     // phone -> { code, expiresAt, purpose }
+  customers: {},        // phone -> { name, address, registeredAt }
+  otpIds: {},           // phone -> { otpId, purpose, expiresAt }
   customerSessions: {}, // token -> phone
 };
 
@@ -50,25 +99,21 @@ await db.read();
 db.data = { ...defaultData, ...db.data };
 if (!db.data.customers) db.data.customers = {};
 if (!db.data.customerSessions) db.data.customerSessions = {};
+if (!db.data.otpIds) db.data.otpIds = {};
 await db.write();
 
-let twilioClient = null;
-if (CONFIG.TWILIO_SID && CONFIG.TWILIO_TOKEN) {
-  twilioClient = twilio(CONFIG.TWILIO_SID, CONFIG.TWILIO_TOKEN);
-  console.log('✓ Twilio connected');
-} else {
-  console.log('⚠  Twilio not configured — demo mode (code: 123456)');
-}
+const D7_ENABLED = !!CONFIG.D7_TOKEN;
+console.log(D7_ENABLED ? '✓ D7 Networks OTP connected' : '⚠  D7 not configured — demo mode (code: 123456)');
 
-// Admin auth
+// ── AUTH MIDDLEWARE ───────────────────────────────────────
 const adminSessions = new Set();
+
 function requireAdmin(req, res, next) {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
   if (!adminSessions.has(token)) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
-// Customer auth middleware
 function requireCustomer(req, res, next) {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
   const phone = db.data.customerSessions[token];
@@ -78,16 +123,7 @@ function requireCustomer(req, res, next) {
   next();
 }
 
-async function sendSMS(phone, message) {
-  if (twilioClient) {
-    await twilioClient.messages.create({ body: message, from: CONFIG.TWILIO_FROM, to: phone });
-    return true;
-  }
-  console.log(`[DEMO SMS to ${phone}]: ${message}`);
-  return false;
-}
-
-// ── PUBLIC: Batch & Products ──────────────────────────────
+// ── PUBLIC: BATCH & PRODUCTS ─────────────────────────────
 app.get('/api/batch', async (req, res) => {
   await db.read();
   if (db.data.batch.status === 'open' && db.data.batch.deadline && new Date(db.data.batch.deadline) < new Date()) {
@@ -97,41 +133,42 @@ app.get('/api/batch', async (req, res) => {
   res.json({ batch: db.data.batch, products: [...db.data.products].sort((a, b) => a.sort - b.sort) });
 });
 
-// ── REGISTRATION: Send code ───────────────────────────────
+// ── AUTH: SEND OTP ────────────────────────────────────────
 app.post('/api/auth/send-code', async (req, res) => {
   const phone = (req.body.phone || '').replace(/\s+/g, '');
-  const purpose = req.body.purpose || 'register'; // 'register' or 'login'
+  const purpose = req.body.purpose || 'register';
   if (!phone) return res.status(400).json({ error: 'Phone required' });
 
   await db.read();
 
-  // If login but not registered
   if (purpose === 'login' && !db.data.customers[phone]) {
     return res.status(404).json({ error: 'No account found. Please register first.' });
   }
 
-  const code = Math.floor(100000 + Math.random() * 900000).toString();
-  db.data.smsCodes[phone] = { code, expiresAt: Date.now() + CONFIG.CODE_EXPIRY_MS, purpose };
-  await db.write();
-
-  const msg = purpose === 'login'
-    ? `Your MINI GT Brunei login code is: ${code}. Valid for 10 minutes.`
-    : `Your MINI GT Brunei registration code is: ${code}. Valid for 10 minutes.`;
+  if (!D7_ENABLED) {
+    // Demo mode — no real SMS
+    db.data.otpIds[phone] = { otpId: 'demo', purpose, expiresAt: Date.now() + 600000 };
+    await db.write();
+    return res.json({ success: true, demo: true });
+  }
 
   try {
-    await sendSMS(phone, msg);
-    res.json({ success: true, demo: !twilioClient });
+    const otpId = await d7SendOTP(phone);
+    db.data.otpIds[phone] = { otpId, purpose, expiresAt: Date.now() + 600000 };
+    await db.write();
+    console.log(`OTP sent to ${phone}, otp_id: ${otpId}`);
+    res.json({ success: true });
   } catch (err) {
-    console.error('SMS error:', err.message);
-    res.status(500).json({ error: 'SMS failed' });
+    console.error('D7 send error:', err.message);
+    res.status(500).json({ error: 'Failed to send OTP. ' + err.message });
   }
 });
 
-// ── REGISTRATION: Verify code + create account ────────────
+// ── AUTH: REGISTER ────────────────────────────────────────
 app.post('/api/auth/register', async (req, res) => {
-  const phone = (req.body.phone || '').replace(/\s+/g, '');
-  const code  = (req.body.code  || '').trim();
-  const name  = (req.body.name  || '').trim();
+  const phone   = (req.body.phone   || '').replace(/\s+/g, '');
+  const code    = (req.body.code    || '').trim();
+  const name    = (req.body.name    || '').trim();
   const address = (req.body.address || '').trim();
 
   if (!phone || !code || !name) return res.status(400).json({ error: 'Phone, code and name required' });
@@ -140,25 +177,26 @@ app.post('/api/auth/register', async (req, res) => {
 
   if (db.data.customers[phone]) return res.status(400).json({ error: 'Account already exists. Please login.' });
 
-  // Verify code
-  if (!twilioClient && code === '123456') {
-    // demo bypass
-  } else {
-    const entry = db.data.smsCodes[phone];
-    if (!entry) return res.json({ verified: false, error: 'No code found — request a new one.' });
-    if (Date.now() > entry.expiresAt) {
-      delete db.data.smsCodes[phone];
-      await db.write();
-      return res.json({ verified: false, error: 'Code expired.' });
-    }
-    if (entry.code !== code) return res.json({ verified: false, error: 'Incorrect code.' });
-    delete db.data.smsCodes[phone];
+  // Verify OTP
+  const entry = db.data.otpIds[phone];
+  if (!entry) return res.json({ verified: false, error: 'No OTP found — request a new one.' });
+  if (Date.now() > entry.expiresAt) {
+    delete db.data.otpIds[phone];
+    await db.write();
+    return res.json({ verified: false, error: 'OTP expired — request a new one.' });
   }
 
-  // Create customer
-  db.data.customers[phone] = { name, phone, address, registeredAt: new Date().toISOString() };
+  let verified = false;
+  if (!D7_ENABLED && code === '123456') {
+    verified = true;
+  } else if (D7_ENABLED) {
+    verified = await d7VerifyOTP(entry.otpId, code);
+  }
 
-  // Create session
+  if (!verified) return res.json({ verified: false, error: 'Incorrect code.' });
+
+  delete db.data.otpIds[phone];
+  db.data.customers[phone] = { name, phone, address, registeredAt: new Date().toISOString() };
   const token = crypto.randomBytes(32).toString('hex');
   db.data.customerSessions[token] = phone;
   await db.write();
@@ -167,7 +205,7 @@ app.post('/api/auth/register', async (req, res) => {
   res.json({ success: true, token, customer: { name, phone, address } });
 });
 
-// ── LOGIN: Verify code ────────────────────────────────────
+// ── AUTH: LOGIN ───────────────────────────────────────────
 app.post('/api/auth/login', async (req, res) => {
   const phone = (req.body.phone || '').replace(/\s+/g, '');
   const code  = (req.body.code  || '').trim();
@@ -178,21 +216,24 @@ app.post('/api/auth/login', async (req, res) => {
 
   if (!db.data.customers[phone]) return res.status(404).json({ error: 'Account not found.' });
 
-  // Verify code
-  if (!twilioClient && code === '123456') {
-    // demo bypass
-  } else {
-    const entry = db.data.smsCodes[phone];
-    if (!entry) return res.json({ verified: false, error: 'No code found.' });
-    if (Date.now() > entry.expiresAt) {
-      delete db.data.smsCodes[phone];
-      await db.write();
-      return res.json({ verified: false, error: 'Code expired.' });
-    }
-    if (entry.code !== code) return res.json({ verified: false, error: 'Incorrect code.' });
-    delete db.data.smsCodes[phone];
+  const entry = db.data.otpIds[phone];
+  if (!entry) return res.json({ verified: false, error: 'No OTP found — request a new one.' });
+  if (Date.now() > entry.expiresAt) {
+    delete db.data.otpIds[phone];
+    await db.write();
+    return res.json({ verified: false, error: 'OTP expired — request a new one.' });
   }
 
+  let verified = false;
+  if (!D7_ENABLED && code === '123456') {
+    verified = true;
+  } else if (D7_ENABLED) {
+    verified = await d7VerifyOTP(entry.otpId, code);
+  }
+
+  if (!verified) return res.json({ verified: false, error: 'Incorrect code.' });
+
+  delete db.data.otpIds[phone];
   const token = crypto.randomBytes(32).toString('hex');
   db.data.customerSessions[token] = phone;
   await db.write();
@@ -201,7 +242,7 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({ success: true, token, customer: { name: customer.name, phone: customer.phone, address: customer.address } });
 });
 
-// ── LOGOUT ────────────────────────────────────────────────
+// ── AUTH: LOGOUT ──────────────────────────────────────────
 app.post('/api/auth/logout', async (req, res) => {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
   delete db.data.customerSessions[token];
@@ -209,12 +250,12 @@ app.post('/api/auth/logout', async (req, res) => {
   res.json({ success: true });
 });
 
-// ── GET current customer ──────────────────────────────────
+// ── AUTH: ME ──────────────────────────────────────────────
 app.get('/api/auth/me', requireCustomer, (req, res) => {
   res.json({ customer: { name: req.customer.name, phone: req.customerPhone, address: req.customer.address } });
 });
 
-// ── SUBMIT ORDER (requires login) ─────────────────────────
+// ── ORDERS ────────────────────────────────────────────────
 app.post('/api/orders', requireCustomer, async (req, res) => {
   await db.read();
   const { items } = req.body;
@@ -223,18 +264,15 @@ app.post('/api/orders', requireCustomer, async (req, res) => {
 
   if (!items?.length) return res.status(400).json({ error: 'No items selected' });
   if (db.data.batch.status !== 'open') return res.status(400).json({ error: 'Pre-order is closed' });
-  if (db.data.orders.find(o => o.phone === phone)) return res.status(400).json({ error: 'You have already placed an order for this batch.' });
-
-  // Validate quantities
+  if (db.data.orders.find(o => o.phone === phone)) {
+    return res.status(400).json({ error: 'You have already placed an order for this batch.' });
+  }
   for (const item of items) {
     if (!item.qty || item.qty < 1) return res.status(400).json({ error: 'Invalid quantity' });
   }
 
   const ref = 'MGT-' + Date.now().toString().slice(-6);
-  db.data.orders.push({
-    ref, name: customer.name, phone, address: customer.address || '',
-    items, verified: true, createdAt: new Date().toISOString()
-  });
+  db.data.orders.push({ ref, name: customer.name, phone, address: customer.address || '', items, verified: true, createdAt: new Date().toISOString() });
   await db.write();
   console.log(`New order: ${ref} — ${customer.name} (${phone})`);
   res.json({ success: true, ref });
@@ -289,5 +327,6 @@ app.get('*', (req, res) => {
 app.listen(CONFIG.PORT, () => {
   console.log(`\n🚗 MINI GT Brunei backend on port ${CONFIG.PORT}`);
   console.log(`   Admin password: ${CONFIG.ADMIN_PASSWORD}`);
+  console.log(`   D7 OTP: ${D7_ENABLED ? 'enabled' : 'demo mode'}`);
   console.log(`   DB: ${DB_PATH}\n`);
 });
