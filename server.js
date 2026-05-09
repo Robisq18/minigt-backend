@@ -436,8 +436,12 @@ app.post('/api/admin/customers/:phone/reset-password', requireAdmin, async (req,
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res) => {
+  // Don't intercept API routes
+  if (req.path.startsWith('/api/') || req.path.startsWith('/images/')) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   const indexPath = path.join(__dirname, 'public', 'index.html');
-  res.sendFile(indexPath, err => { if (err) res.status(200).send('MINI GT API running'); });
+  res.sendFile(indexPath, err => { if (err) res.status(200).json({ status: 'MINI GT API running' }); });
 });
 
 app.listen(CONFIG.PORT);
