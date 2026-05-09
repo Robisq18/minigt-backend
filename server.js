@@ -1,6 +1,7 @@
 // ============================================================
-// MINI GT Brunei — Backend with D7 Networks OTP API
-// D7 handles code generation + verification natively
+// MINI GT Brunei — Backend v3
+// Phone+Password auth, Firebase OTP for registration only
+// Full user management, order history
 // ============================================================
 
 import express from 'express';
@@ -8,8 +9,6 @@ import cors from 'cors';
 import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
 import crypto from 'crypto';
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -21,83 +20,23 @@ app.use(cors());
 const CONFIG = {
   PORT:           process.env.PORT || 3000,
   ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'admin123',
-  D7_TOKEN:       process.env.D7_API_TOKEN || '',
-  D7_ORIGINATOR:  process.env.D7_ORIGINATOR || 'MINIGT',
-  D7_CHANNEL:     process.env.D7_CHANNEL || 'sms', // 'sms' or 'whatsapp'
-  CODE_EXPIRY:    600, // seconds (10 minutes)
+  FIREBASE_API_KEY: process.env.FIREBASE_API_KEY || 'AIzaSyCcpBE8U_SxKg8mRSG7X3VN_u-YJFVms1Q',
 };
 
-// D7 OTP API base URL
-const D7_OTP_URL = 'https://api.d7networks.com/verify/v1';
-
-// ── D7 OTP HELPERS ────────────────────────────────────────
-// D7 sends the code AND verifies it — we just store the otp_id they return
-
-async function d7SendOTP(phone) {
-  const channel = CONFIG.D7_CHANNEL; // 'sms' or 'whatsapp'
-  const body = channel === 'whatsapp'
-    ? {
-        originator: CONFIG.D7_ORIGINATOR,
-        recipient: phone,
-        content: 'Your MINI GT Brunei verification code is: {}. Valid for 10 minutes.',
-        expiry: CONFIG.CODE_EXPIRY,
-        channel: 'whatsapp',
-      }
-    : {
-        originator: CONFIG.D7_ORIGINATOR,
-        recipient: phone,
-        content: 'Your MINI GT Brunei verification code is: {}. Valid for 10 minutes.',
-        expiry: CONFIG.CODE_EXPIRY,
-        data_coding: 'text',
-      };
-
-  const res = await fetch(`${D7_OTP_URL}/otp/send-otp`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'Authorization': `Bearer ${CONFIG.D7_TOKEN}`,
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.detail || `D7 error ${res.status}`);
-  }
-  const data = await res.json();
-  return data.otp_id; // D7 returns an otp_id we use to verify later
+// ── HELPERS ───────────────────────────────────────────────
+function hashPassword(pw) {
+  return crypto.createHash('sha256').update(pw + 'minigt-salt-2025').digest('hex');
 }
-
-async function d7VerifyOTP(otpId, code) {
-  const res = await fetch(`${D7_OTP_URL}/otp/verify-otp`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'Authorization': `Bearer ${CONFIG.D7_TOKEN}`,
-    },
-    body: JSON.stringify({ otp_id: otpId, otp_code: code }),
-  });
-  if (!res.ok) return false;
-  const data = await res.json();
-  return data.status === 'approved';
-}
-
-
-// ── FIREBASE ADMIN ────────────────────────────────────────
-// Verifies Firebase ID tokens from the frontend
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'minigt-brunei';
 
 async function verifyFirebaseToken(idToken) {
-  // Verify token using Firebase's public key endpoint
   const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${process.env.FIREBASE_API_KEY || 'AIzaSyCcpBE8U_SxKg8mRSG7X3VN_u-YJFVms1Q'}`,
-    { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ idToken }) }
+    `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${CONFIG.FIREBASE_API_KEY}`,
+    { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ idToken }) }
   );
   if (!res.ok) throw new Error('Invalid Firebase token');
   const data = await res.json();
-  if (!data.users || !data.users[0]) throw new Error('User not found');
-  return data.users[0]; // contains phoneNumber, localId etc
+  if (!data.users?.[0]) throw new Error('User not found');
+  return data.users[0];
 }
 
 // ── DATABASE ──────────────────────────────────────────────
@@ -107,34 +46,36 @@ const defaultData = {
   batch: {
     title: 'Batch #12 — May 2025',
     desc: 'Select your models and place your pre-order before the deadline.',
-    deadline: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+    deadline: new Date(Date.now() + 7*24*60*60*1000).toISOString(),
     status: 'open',
   },
   products: [
-    { id: 'p1', name: 'Nissan Skyline GT-R R34 V-Spec', scale: '1:64', price: 8.90, image: '', sort: 1 },
-    { id: 'p2', name: 'Toyota Supra A80 RZ',            scale: '1:64', price: 8.90, image: '', sort: 2 },
-    { id: 'p3', name: 'Honda NSX Type R NA1',           scale: '1:64', price: 9.50, image: '', sort: 3 },
-    { id: 'p4', name: 'Mazda RX-7 FD3S Spirit R',       scale: '1:64', price: 9.50, image: '', sort: 4 },
-    { id: 'p5', name: 'Mitsubishi Lancer Evo IX',       scale: '1:64', price: 8.90, image: '', sort: 5 },
-    { id: 'p6', name: 'Subaru Impreza WRX STI',         scale: '1:64', price: 8.90, image: '', sort: 6 },
+    { id:'p1', name:'Nissan Skyline GT-R R34 V-Spec', scale:'1:64', price:8.90, image:'', sort:1 },
+    { id:'p2', name:'Toyota Supra A80 RZ',            scale:'1:64', price:8.90, image:'', sort:2 },
+    { id:'p3', name:'Honda NSX Type R NA1',           scale:'1:64', price:9.50, image:'', sort:3 },
+    { id:'p4', name:'Mazda RX-7 FD3S Spirit R',       scale:'1:64', price:9.50, image:'', sort:4 },
+    { id:'p5', name:'Mitsubishi Lancer Evo IX',       scale:'1:64', price:8.90, image:'', sort:5 },
+    { id:'p6', name:'Subaru Impreza WRX STI',         scale:'1:64', price:8.90, image:'', sort:6 },
   ],
+  // customers: { phone -> { id, firstName, lastName, phone, passwordHash, createdAt } }
+  customers: {},
+  // orders: [ { ref, customerId, phone, name, batchTitle, items, createdAt } ]
   orders: [],
-  customers: {},        // phone -> { name, address, registeredAt }
-  otpIds: {},           // phone -> { otpId, purpose, expiresAt }
-  customerSessions: {}, // token -> phone
+  // sessions: { token -> phone }
+  customerSessions: {},
 };
 
 const adapter = new JSONFile(DB_PATH);
 const db = new Low(adapter, defaultData);
 await db.read();
 db.data = { ...defaultData, ...db.data };
-if (!db.data.customers) db.data.customers = {};
+if (!db.data.customers)       db.data.customers = {};
 if (!db.data.customerSessions) db.data.customerSessions = {};
-if (!db.data.otpIds) db.data.otpIds = {};
 await db.write();
 
-const D7_ENABLED = !!CONFIG.D7_TOKEN;
-console.log(D7_ENABLED ? '✓ D7 Networks OTP connected' : '⚠  D7 not configured — demo mode (code: 123456)');
+console.log(`\n🚗 MINI GT Brunei backend on port ${CONFIG.PORT}`);
+console.log(`   Admin password: ${CONFIG.ADMIN_PASSWORD}`);
+console.log(`   DB: ${DB_PATH}\n`);
 
 // ── AUTH MIDDLEWARE ───────────────────────────────────────
 const adminSessions = new Set();
@@ -154,126 +95,87 @@ function requireCustomer(req, res, next) {
   next();
 }
 
-// ── PUBLIC: BATCH & PRODUCTS ─────────────────────────────
+// ── PUBLIC: BATCH & PRODUCTS ──────────────────────────────
 app.get('/api/batch', async (req, res) => {
   await db.read();
   if (db.data.batch.status === 'open' && db.data.batch.deadline && new Date(db.data.batch.deadline) < new Date()) {
     db.data.batch.status = 'closed';
     await db.write();
   }
-  res.json({ batch: db.data.batch, products: [...db.data.products].sort((a, b) => a.sort - b.sort) });
+  res.json({ batch: db.data.batch, products: [...db.data.products].sort((a,b) => a.sort - b.sort) });
 });
 
-// ── AUTH: SEND OTP ────────────────────────────────────────
-app.post('/api/auth/send-code', async (req, res) => {
-  const phone = (req.body.phone || '').replace(/\s+/g, '');
-  const purpose = req.body.purpose || 'register';
-  if (!phone) return res.status(400).json({ error: 'Phone required' });
-
-  await db.read();
-
-  if (purpose === 'login' && !db.data.customers[phone]) {
-    return res.status(404).json({ error: 'No account found. Please register first.' });
-  }
-
-  if (!D7_ENABLED) {
-    // Demo mode — no real SMS
-    db.data.otpIds[phone] = { otpId: 'demo', purpose, expiresAt: Date.now() + 600000 };
-    await db.write();
-    return res.json({ success: true, demo: true });
-  }
-
-  try {
-    const otpId = await d7SendOTP(phone);
-    db.data.otpIds[phone] = { otpId, purpose, expiresAt: Date.now() + 600000 };
-    await db.write();
-    console.log(`OTP sent to ${phone}, otp_id: ${otpId}`);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('D7 send error:', err.message);
-    res.status(500).json({ error: 'Failed to send OTP. ' + err.message });
-  }
-});
-
-// ── AUTH: REGISTER ────────────────────────────────────────
+// ── REGISTER: Step 1 — Firebase verifies phone, we create account ─
 app.post('/api/auth/register', async (req, res) => {
-  const phone   = (req.body.phone   || '').replace(/\s+/g, '');
-  const code    = (req.body.code    || '').trim();
-  const name    = (req.body.name    || '').trim();
-  const address = (req.body.address || '').trim();
+  const { idToken, phone, firstName, lastName, password } = req.body;
+  if (!idToken || !phone || !firstName || !lastName || !password) {
+    return res.status(400).json({ error: 'All fields are required' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
 
-  if (!phone || !code || !name) return res.status(400).json({ error: 'Phone, code and name required' });
+  // Verify Firebase token (confirms phone ownership)
+  try {
+    await verifyFirebaseToken(idToken);
+  } catch(e) {
+    return res.status(401).json({ error: 'Phone verification failed. Please try again.' });
+  }
 
   await db.read();
 
-  if (db.data.customers[phone]) return res.status(400).json({ error: 'Account already exists. Please login.' });
+  // Normalize phone — strip country code for storage, keep consistent
+  const cleanPhone = phone.replace(/\s+/g, '');
 
-  // Verify OTP
-  const entry = db.data.otpIds[phone];
-  if (!entry) return res.json({ verified: false, error: 'No OTP found — request a new one.' });
-  if (Date.now() > entry.expiresAt) {
-    delete db.data.otpIds[phone];
-    await db.write();
-    return res.json({ verified: false, error: 'OTP expired — request a new one.' });
+  if (db.data.customers[cleanPhone]) {
+    return res.status(400).json({ error: 'An account with this number already exists. Please login.' });
   }
 
-  let verified = false;
-  if (!D7_ENABLED && code === '123456') {
-    verified = true;
-  } else if (D7_ENABLED) {
-    verified = await d7VerifyOTP(entry.otpId, code);
-  }
+  const customerId = 'cust_' + Date.now();
+  db.data.customers[cleanPhone] = {
+    id: customerId,
+    firstName: firstName.trim(),
+    lastName: lastName.trim(),
+    phone: cleanPhone,
+    passwordHash: hashPassword(password),
+    createdAt: new Date().toISOString(),
+  };
 
-  if (!verified) return res.json({ verified: false, error: 'Incorrect code.' });
-
-  delete db.data.otpIds[phone];
-  db.data.customers[phone] = { name, phone, address, registeredAt: new Date().toISOString() };
   const token = crypto.randomBytes(32).toString('hex');
-  db.data.customerSessions[token] = phone;
+  db.data.customerSessions[token] = cleanPhone;
   await db.write();
 
-  console.log(`New customer: ${name} (${phone})`);
-  res.json({ success: true, token, customer: { name, phone, address } });
+  const c = db.data.customers[cleanPhone];
+  console.log(`New customer: ${c.firstName} ${c.lastName} (${cleanPhone})`);
+  res.json({ success: true, token, customer: { id: c.id, firstName: c.firstName, lastName: c.lastName, phone: cleanPhone } });
 });
 
-// ── AUTH: LOGIN ───────────────────────────────────────────
+// ── LOGIN: phone (no country code) + password ─────────────
 app.post('/api/auth/login', async (req, res) => {
-  const phone = (req.body.phone || '').replace(/\s+/g, '');
-  const code  = (req.body.code  || '').trim();
-
-  if (!phone || !code) return res.status(400).json({ error: 'Phone and code required' });
+  const { phone, countryCode, password } = req.body;
+  if (!phone || !password) return res.status(400).json({ error: 'Phone and password required' });
 
   await db.read();
 
-  if (!db.data.customers[phone]) return res.status(404).json({ error: 'Account not found.' });
+  // Try with country code first, then without
+  const cc = countryCode || '+673';
+  const fullPhone = cc + phone.replace(/\s+/g, '');
+  const customer = db.data.customers[fullPhone] || db.data.customers[phone];
+  const resolvedPhone = db.data.customers[fullPhone] ? fullPhone : phone;
 
-  const entry = db.data.otpIds[phone];
-  if (!entry) return res.json({ verified: false, error: 'No OTP found — request a new one.' });
-  if (Date.now() > entry.expiresAt) {
-    delete db.data.otpIds[phone];
-    await db.write();
-    return res.json({ verified: false, error: 'OTP expired — request a new one.' });
+  if (!customer) return res.status(404).json({ error: 'No account found with this number.' });
+  if (customer.passwordHash !== hashPassword(password)) {
+    return res.status(401).json({ error: 'Incorrect password.' });
   }
 
-  let verified = false;
-  if (!D7_ENABLED && code === '123456') {
-    verified = true;
-  } else if (D7_ENABLED) {
-    verified = await d7VerifyOTP(entry.otpId, code);
-  }
-
-  if (!verified) return res.json({ verified: false, error: 'Incorrect code.' });
-
-  delete db.data.otpIds[phone];
   const token = crypto.randomBytes(32).toString('hex');
-  db.data.customerSessions[token] = phone;
+  db.data.customerSessions[token] = resolvedPhone;
   await db.write();
 
-  const customer = db.data.customers[phone];
-  res.json({ success: true, token, customer: { name: customer.name, phone: customer.phone, address: customer.address } });
+  res.json({ success: true, token, customer: { id: customer.id, firstName: customer.firstName, lastName: customer.lastName, phone: resolvedPhone } });
 });
 
-// ── AUTH: LOGOUT ──────────────────────────────────────────
+// ── LOGOUT ────────────────────────────────────────────────
 app.post('/api/auth/logout', async (req, res) => {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
   delete db.data.customerSessions[token];
@@ -281,12 +183,22 @@ app.post('/api/auth/logout', async (req, res) => {
   res.json({ success: true });
 });
 
-// ── AUTH: ME ──────────────────────────────────────────────
+// ── ME ────────────────────────────────────────────────────
 app.get('/api/auth/me', requireCustomer, (req, res) => {
-  res.json({ customer: { name: req.customer.name, phone: req.customerPhone, address: req.customer.address } });
+  const c = req.customer;
+  res.json({ customer: { id: c.id, firstName: c.firstName, lastName: c.lastName, phone: req.customerPhone } });
 });
 
-// ── ORDERS ────────────────────────────────────────────────
+// ── ORDER HISTORY (for logged-in customer) ────────────────
+app.get('/api/orders/my', requireCustomer, async (req, res) => {
+  await db.read();
+  const myOrders = db.data.orders
+    .filter(o => o.phone === req.customerPhone)
+    .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
+  res.json({ orders: myOrders });
+});
+
+// ── SUBMIT ORDER ──────────────────────────────────────────
 app.post('/api/orders', requireCustomer, async (req, res) => {
   await db.read();
   const { items } = req.body;
@@ -294,67 +206,33 @@ app.post('/api/orders', requireCustomer, async (req, res) => {
   const customer = req.customer;
 
   if (!items?.length) return res.status(400).json({ error: 'No items selected' });
-  if (db.data.batch.status !== 'open') return res.status(400).json({ error: 'Pre-order is closed' });
-  if (db.data.orders.find(o => o.phone === phone)) {
-    return res.status(400).json({ error: 'You have already placed an order for this batch.' });
-  }
+  if (db.data.batch.status !== 'open') return res.status(400).json({ error: 'Pre-order is currently closed.' });
+
+  // Check duplicate for THIS batch only (by batch title)
+  const duplicate = db.data.orders.find(o => o.phone === phone && o.batchTitle === db.data.batch.title);
+  if (duplicate) return res.status(400).json({ error: 'You have already placed an order for this batch.' });
+
   for (const item of items) {
     if (!item.qty || item.qty < 1) return res.status(400).json({ error: 'Invalid quantity' });
   }
 
   const ref = 'MGT-' + Date.now().toString().slice(-6);
-  db.data.orders.push({ ref, name: customer.name, phone, address: customer.address || '', items, verified: true, createdAt: new Date().toISOString() });
+  db.data.orders.push({
+    ref,
+    customerId: customer.id,
+    phone,
+    customerName: `${customer.firstName} ${customer.lastName}`,
+    batchTitle: db.data.batch.title,
+    items,
+    createdAt: new Date().toISOString(),
+  });
   await db.write();
-  console.log(`New order: ${ref} — ${customer.name} (${phone})`);
+
+  console.log(`New order: ${ref} — ${customer.firstName} ${customer.lastName} (${phone})`);
   res.json({ success: true, ref });
 });
 
-// ── AUTH: FIREBASE LOGIN (phone verified by Firebase) ────
-app.post('/api/auth/firebase-login', async (req, res) => {
-  const { idToken, phone } = req.body;
-  if (!idToken || !phone) return res.status(400).json({ error: 'Missing token or phone' });
-
-  try {
-    await verifyFirebaseToken(idToken);
-  } catch(e) {
-    return res.status(401).json({ error: 'Invalid Firebase token' });
-  }
-
-  await db.read();
-  const customer = db.data.customers[phone];
-  if (!customer) return res.status(404).json({ error: 'No account found. Please register first.' });
-
-  const token = crypto.randomBytes(32).toString('hex');
-  db.data.customerSessions[token] = phone;
-  await db.write();
-
-  res.json({ success: true, token, customer: { name: customer.name, phone: customer.phone, address: customer.address } });
-});
-
-// ── AUTH: FIREBASE REGISTER (phone verified by Firebase) ─
-app.post('/api/auth/firebase-register', async (req, res) => {
-  const { idToken, phone, name, address } = req.body;
-  if (!idToken || !phone || !name) return res.status(400).json({ error: 'Missing required fields' });
-
-  try {
-    await verifyFirebaseToken(idToken);
-  } catch(e) {
-    return res.status(401).json({ error: 'Invalid Firebase token' });
-  }
-
-  await db.read();
-  if (db.data.customers[phone]) return res.status(400).json({ error: 'Account already exists. Please login.' });
-
-  db.data.customers[phone] = { name, phone, address: address || '', registeredAt: new Date().toISOString() };
-  const token = crypto.randomBytes(32).toString('hex');
-  db.data.customerSessions[token] = phone;
-  await db.write();
-
-  console.log(`New customer (Firebase): ${name} (${phone})`);
-  res.json({ success: true, token, customer: { name, phone, address: address || '' } });
-});
-
-// ── ADMIN ─────────────────────────────────────────────────
+// ── ADMIN: LOGIN ──────────────────────────────────────────
 app.post('/api/admin/login', (req, res) => {
   if (req.body.password !== CONFIG.ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password' });
   const token = crypto.randomBytes(32).toString('hex');
@@ -362,16 +240,61 @@ app.post('/api/admin/login', (req, res) => {
   res.json({ token });
 });
 
+// ── ADMIN: ORDERS ─────────────────────────────────────────
 app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   await db.read();
   res.json({ orders: db.data.orders });
 });
 
+// ── ADMIN: CUSTOMERS (full list) ──────────────────────────
 app.get('/api/admin/customers', requireAdmin, async (req, res) => {
   await db.read();
-  res.json({ customers: Object.values(db.data.customers) });
+  const customers = Object.values(db.data.customers).map(c => {
+    const orders = db.data.orders.filter(o => o.phone === c.phone);
+    return { ...c, passwordHash: undefined, orderCount: orders.length, orders };
+  });
+  res.json({ customers });
 });
 
+// ── ADMIN: EDIT CUSTOMER ──────────────────────────────────
+app.put('/api/admin/customers/:phone', requireAdmin, async (req, res) => {
+  await db.read();
+  const phone = decodeURIComponent(req.params.phone);
+  if (!db.data.customers[phone]) return res.status(404).json({ error: 'Customer not found' });
+  const { firstName, lastName } = req.body;
+  if (firstName) db.data.customers[phone].firstName = firstName;
+  if (lastName)  db.data.customers[phone].lastName  = lastName;
+  await db.write();
+  res.json({ success: true });
+});
+
+// ── ADMIN: DELETE CUSTOMER ────────────────────────────────
+app.delete('/api/admin/customers/:phone', requireAdmin, async (req, res) => {
+  await db.read();
+  const phone = decodeURIComponent(req.params.phone);
+  if (!db.data.customers[phone]) return res.status(404).json({ error: 'Customer not found' });
+  delete db.data.customers[phone];
+  // Remove their sessions
+  for (const [token, p] of Object.entries(db.data.customerSessions)) {
+    if (p === phone) delete db.data.customerSessions[token];
+  }
+  await db.write();
+  res.json({ success: true });
+});
+
+// ── ADMIN: RESET CUSTOMER PASSWORD ───────────────────────
+app.post('/api/admin/customers/:phone/reset-password', requireAdmin, async (req, res) => {
+  await db.read();
+  const phone = decodeURIComponent(req.params.phone);
+  const { newPassword } = req.body;
+  if (!db.data.customers[phone]) return res.status(404).json({ error: 'Customer not found' });
+  if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Password too short' });
+  db.data.customers[phone].passwordHash = hashPassword(newPassword);
+  await db.write();
+  res.json({ success: true });
+});
+
+// ── ADMIN: BATCH ──────────────────────────────────────────
 app.put('/api/admin/batch', requireAdmin, async (req, res) => {
   await db.read();
   db.data.batch = { ...db.data.batch, ...req.body };
@@ -379,9 +302,10 @@ app.put('/api/admin/batch', requireAdmin, async (req, res) => {
   res.json({ success: true });
 });
 
+// ── ADMIN: PRODUCTS ───────────────────────────────────────
 app.post('/api/admin/products', requireAdmin, async (req, res) => {
   await db.read();
-  const prod = { id: 'p' + Date.now(), sort: db.data.products.length + 1, image: '', ...req.body };
+  const prod = { id:'p'+Date.now(), sort: db.data.products.length+1, image:'', ...req.body };
   db.data.products.push(prod);
   await db.write();
   res.json({ id: prod.id, success: true });
@@ -400,9 +324,4 @@ app.get('*', (req, res) => {
   res.sendFile(indexPath, err => { if (err) res.status(200).send('MINI GT API running'); });
 });
 
-app.listen(CONFIG.PORT, () => {
-  console.log(`\n🚗 MINI GT Brunei backend on port ${CONFIG.PORT}`);
-  console.log(`   Admin password: ${CONFIG.ADMIN_PASSWORD}`);
-  console.log(`   D7 OTP: ${D7_ENABLED ? 'enabled' : 'demo mode'}`);
-  console.log(`   DB: ${DB_PATH}\n`);
-});
+app.listen(CONFIG.PORT);
