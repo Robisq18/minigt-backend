@@ -232,6 +232,25 @@ app.post('/api/orders', requireCustomer, async (req, res) => {
   res.json({ success: true, ref });
 });
 
+// ── CHANGE PASSWORD ───────────────────────────────────────
+app.post('/api/auth/change-password', requireCustomer, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Both passwords required' });
+  if (newPassword.length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
+
+  await db.read();
+  const customer = db.data.customers[req.customerPhone];
+  if (!customer) return res.status(404).json({ error: 'Account not found' });
+  if (customer.passwordHash !== hashPassword(currentPassword)) {
+    return res.status(401).json({ error: 'Current password is incorrect' });
+  }
+
+  db.data.customers[req.customerPhone].passwordHash = hashPassword(newPassword);
+  await db.write();
+  console.log(`Password changed for ${req.customerPhone}`);
+  res.json({ success: true });
+});
+
 // ── ADMIN: LOGIN ──────────────────────────────────────────
 app.post('/api/admin/login', (req, res) => {
   if (req.body.password !== CONFIG.ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password' });
