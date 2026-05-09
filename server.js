@@ -304,10 +304,6 @@ app.post('/api/admin/batches', requireAdmin, async (req, res) => {
   const { ref, title, desc, deadline } = req.body;
   if (!ref || !title) return res.status(400).json({ error: 'Ref and title required' });
 
-  // Only one active batch at a time
-  const alreadyActive = db.data.batches.find(b => b.status === 'active');
-  if (alreadyActive) return res.status(400).json({ error: 'Close the current active batch before creating a new one.' });
-
   const batch = {
     id: generateId('batch'), ref: ref.trim(), title: title.trim(),
     desc: (desc || '').trim(), deadline: deadline || null,
