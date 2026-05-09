@@ -353,6 +353,7 @@ app.post('/api/admin/batches/:id/products', requireAdmin, async (req, res) => {
   const product = {
     id: generateId('prod'),
     batchId: req.params.id,
+    model: (req.body.model || '').trim(),
     name: req.body.name, scale: req.body.scale || '1:64',
     price: parseFloat(req.body.price), image: req.body.image || '',
     sort: existing.length + 1, createdAt: new Date().toISOString(),
