@@ -84,11 +84,14 @@ console.log(`   Data dir: ${CONFIG.DATA_DIR}`);
 console.log(`   DB: ${DB_PATH}\n`);
 
 // ── AUTH MIDDLEWARE ───────────────────────────────────────
-const adminSessions = new Set();
+// Admin token is deterministic — survives server restarts
+function getAdminToken() {
+  return crypto.createHash('sha256').update('admin-' + CONFIG.ADMIN_PASSWORD + '-minigt').digest('hex');
+}
 
 function requireAdmin(req, res, next) {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
-  if (!adminSessions.has(token)) return res.status(401).json({ error: 'Unauthorized' });
+  if (token !== getAdminToken()) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
@@ -280,9 +283,7 @@ app.delete('/api/admin/images/:fileName', requireAdmin, async (req, res) => {
 // ── ADMIN: LOGIN ──────────────────────────────────────────
 app.post('/api/admin/login', (req, res) => {
   if (req.body.password !== CONFIG.ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password' });
-  const token = crypto.randomBytes(32).toString('hex');
-  adminSessions.add(token);
-  res.json({ token });
+  res.json({ token: getAdminToken() });
 });
 
 // ── ADMIN: BATCHES ────────────────────────────────────────
