@@ -333,6 +333,16 @@ app.post('/api/admin/batches/:id/close', requireAdmin, async (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/api/admin/batches/:id/reopen', requireAdmin, async (req, res) => {
+  await db.read();
+  const batch = db.data.batches.find(b => b.id === req.params.id);
+  if (!batch) return res.status(404).json({ error: 'Batch not found' });
+  batch.status = 'active';
+  delete batch.closedAt;
+  await db.write();
+  res.json({ success: true });
+});
+
 // ── ADMIN: PRODUCTS ───────────────────────────────────────
 app.get('/api/admin/batches/:id/products', requireAdmin, async (req, res) => {
   await db.read();
