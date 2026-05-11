@@ -235,10 +235,10 @@ app.get('/api/orders/my', requireCustomer, async (req, res) => {
   // Group by PO number for display
   const poMap = {};
   myOrders.forEach(o => {
-    const po = o.poNumber || o.ref;
+    const po = o.poNumber || ('LEGACY-' + o.ref);
     if (!poMap[po]) {
       poMap[po] = {
-        poNumber: po,
+        poNumber: o.poNumber || o.ref,
         createdAt: o.createdAt,
         batchOrders: [],
       };
@@ -485,10 +485,10 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   // Group orders by PO number
   const poMap = {};
   orders.forEach(o => {
-    const po = o.poNumber || o.ref; // fallback for old orders without poNumber
+    const po = o.poNumber || ('LEGACY-' + o.ref);
     if (!poMap[po]) {
       poMap[po] = {
-        poNumber: po,
+        poNumber: o.poNumber || o.ref, // show actual PO or ref for legacy
         customerName: o.customerName,
         phone: o.phone,
         createdAt: o.createdAt,
@@ -509,6 +509,19 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
   res.json({ orders, preorders });
+});
+
+// ── ADMIN: DELETE ORDER ─────────────────────────
+app.delete('/api/admin/orders/:poNumber', requireAdmin, async (req, res) => {
+  await db.read();
+  const poNumber = decodeURIComponent(req.params.poNumber);
+  const before = db.data.orders.length;
+  db.data.orders = db.data.orders.filter(o => o.poNumber !== poNumber && o.ref !== poNumber);
+  const deleted = before - db.data.orders.length;
+  if (deleted === 0) return res.status(404).json({ error: 'Order not found' });
+  await db.write();
+  console.log(`Deleted preorder ${poNumber} (${deleted} records)`);
+  res.json({ success: true, deleted });
 });
 
 // ── ADMIN: CUSTOMERS ──────────────────────────────────────
