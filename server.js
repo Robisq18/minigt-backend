@@ -299,13 +299,20 @@ app.post('/api/orders/preorder', requireCustomer, async (req, res) => {
   const customer = req.customer;
   if (!batches?.length) return res.status(400).json({ error: 'No batches provided' });
 
-  // Validate all batches first
+  // Validate all batches — collect ALL conflicts before returning
+  const conflicts = [];
   for (const b of batches) {
     const batch = db.data.batches.find(x => x.id === b.batchId);
     if (!batch) return res.status(404).json({ error: 'Batch not found: ' + b.batchId });
     if (batch.status !== 'active') return res.status(400).json({ error: batch.ref + ' is no longer active.' });
     const dup = db.data.orders.find(o => o.phone === phone && o.batchId === b.batchId);
-    if (dup) return res.status(400).json({ error: 'You already ordered from ' + batch.ref });
+    if (dup) conflicts.push(batch.ref + ' — ' + batch.title);
+  }
+  if (conflicts.length) {
+    return res.status(400).json({
+      error: 'You have already ordered from: ' + conflicts.join(', '),
+      conflicts
+    });
   }
 
   // Generate single PO number for all batches
