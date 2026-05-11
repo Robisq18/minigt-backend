@@ -40,6 +40,7 @@ function hashPassword(pw) {
 }
 
 function generatePONumber(poCounter) {
+  if (!poCounter) poCounter = {};
   const now = new Date();
   const dateKey = now.getFullYear().toString()
     + String(now.getMonth()+1).padStart(2,'0')
@@ -90,6 +91,7 @@ await db.read();
 db.data = { ...defaultData, ...db.data };
 if (!db.data.batches)          db.data.batches = [];
 if (!db.data.products)         db.data.products = [];
+if (!db.data.orders)           db.data.orders = [];
 if (!db.data.customers)        db.data.customers = {};
 if (!db.data.customerSessions) db.data.customerSessions = {};
 if (!db.data.preorders)        db.data.preorders = [];
