@@ -80,6 +80,7 @@ const defaultData = {
   orders: [],
   // poCounter: { 'YYYYMMDD': lastNumber }
   poCounter: {},
+  maintenance: { enabled: false },
   // customers: { phone -> { id, firstName, lastName, phone, passwordHash, createdAt } }
   customers: {},
   customerSessions: {},
@@ -96,6 +97,7 @@ if (!db.data.customers)        db.data.customers = {};
 if (!db.data.customerSessions) db.data.customerSessions = {};
 if (!db.data.preorders)        db.data.preorders = [];
 if (!db.data.poCounter)        db.data.poCounter = {};
+if (!db.data.maintenance)      db.data.maintenance = { enabled: false };
 await db.write();
 
 console.log(`\n🚗 MINI GT Brunei backend on port ${CONFIG.PORT}`);
@@ -122,6 +124,20 @@ function requireCustomer(req, res, next) {
   req.customer = db.data.customers[phone];
   next();
 }
+
+// ── MAINTENANCE ──────────────────────────────────────────
+app.get('/api/maintenance', async (req, res) => {
+  await db.read();
+  res.json({ enabled: db.data.maintenance?.enabled || false });
+});
+
+app.post('/api/admin/maintenance', requireAdmin, async (req, res) => {
+  await db.read();
+  db.data.maintenance = { enabled: !!req.body.enabled };
+  await db.write();
+  console.log('Maintenance mode:', db.data.maintenance.enabled ? 'ON' : 'OFF');
+  res.json({ success: true, enabled: db.data.maintenance.enabled });
+});
 
 // ── PUBLIC: ALL BATCHES (for dropdown) ───────────────────
 app.get('/api/batches', async (req, res) => {
