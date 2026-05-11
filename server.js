@@ -39,6 +39,17 @@ function hashPassword(pw) {
   return crypto.createHash('sha256').update(pw + 'minigt-salt-2025').digest('hex');
 }
 
+function generatePONumber(poCounter) {
+  const now = new Date();
+  const dateKey = now.getFullYear().toString()
+    + String(now.getMonth()+1).padStart(2,'0')
+    + String(now.getDate()).padStart(2,'0');
+  const last = poCounter[dateKey] || 1000;
+  const next = last + 1;
+  poCounter[dateKey] = next;
+  return 'PO' + dateKey + next;
+}
+
 async function verifyFirebaseToken(idToken) {
   const res = await fetch(
     `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${CONFIG.FIREBASE_API_KEY}`,
@@ -62,8 +73,12 @@ const defaultData = {
   batches: [],
   // products: [ { id, batchId, name, scale, price, image, sort, createdAt } ]
   products: [],
-  // orders: [ { ref, batchId, batchTitle, batchRef, customerId, phone, customerName, items, createdAt } ]
+  // preorders: [ { poNumber, customerId, phone, customerName, createdAt, batchOrders: [{ref,batchId,batchTitle,batchRef,items}] } ]
+  preorders: [],
+  // orders: [ { ref, poNumber, batchId, batchTitle, batchRef, customerId, phone, customerName, items, createdAt } ]
   orders: [],
+  // poCounter: { 'YYYYMMDD': lastNumber }
+  poCounter: {},
   // customers: { phone -> { id, firstName, lastName, phone, passwordHash, createdAt } }
   customers: {},
   customerSessions: {},
@@ -77,6 +92,8 @@ if (!db.data.batches)          db.data.batches = [];
 if (!db.data.products)         db.data.products = [];
 if (!db.data.customers)        db.data.customers = {};
 if (!db.data.customerSessions) db.data.customerSessions = {};
+if (!db.data.preorders)        db.data.preorders = [];
+if (!db.data.poCounter)        db.data.poCounter = {};
 await db.write();
 
 console.log(`\n🚗 MINI GT Brunei backend on port ${CONFIG.PORT}`);
@@ -214,9 +231,33 @@ app.get('/api/orders/my', requireCustomer, async (req, res) => {
   const myOrders = db.data.orders
     .filter(o => o.phone === req.customerPhone)
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  res.json({ orders: myOrders });
+
+  // Group by PO number for display
+  const poMap = {};
+  myOrders.forEach(o => {
+    const po = o.poNumber || o.ref;
+    if (!poMap[po]) {
+      poMap[po] = {
+        poNumber: po,
+        createdAt: o.createdAt,
+        batchOrders: [],
+      };
+    }
+    poMap[po].batchOrders.push({
+      ref: o.ref,
+      batchTitle: o.batchTitle,
+      batchRef: o.batchRef,
+      items: o.items,
+    });
+  });
+
+  const preorders = Object.values(poMap)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  res.json({ orders: myOrders, preorders });
 });
 
+// Submit multiple batch orders in one preorder
 app.post('/api/orders', requireCustomer, async (req, res) => {
   await db.read();
   const { batchId, items } = req.body;
@@ -231,16 +272,64 @@ app.post('/api/orders', requireCustomer, async (req, res) => {
   const duplicate = db.data.orders.find(o => o.phone === phone && o.batchId === batchId);
   if (duplicate) return res.status(400).json({ error: 'You have already placed an order for this batch.' });
 
-  const ref = batch.ref + '-' + Date.now().toString().slice(-4);
-  db.data.orders.push({
-    ref, batchId, batchTitle: batch.title, batchRef: batch.ref,
+  // Generate PO number
+  const poNumber = generatePONumber(db.data.poCounter);
+  const batchOrderRef = poNumber + 'B' + (db.data.orders.filter(o => o.poNumber === poNumber).length + 1);
+
+  const orderRecord = {
+    ref: batchOrderRef,
+    poNumber,
+    batchId, batchTitle: batch.title, batchRef: batch.ref,
     customerId: customer.id, phone,
     customerName: `${customer.firstName} ${customer.lastName}`,
     items, createdAt: new Date().toISOString(),
-  });
+  };
+
+  db.data.orders.push(orderRecord);
   await db.write();
-  console.log(`New order: ${ref} — ${customer.firstName} ${customer.lastName}`);
-  res.json({ success: true, ref });
+  console.log(`New order: ${batchOrderRef} (PO: ${poNumber}) — ${customer.firstName} ${customer.lastName}`);
+  res.json({ success: true, ref: batchOrderRef, poNumber });
+});
+
+// Submit all batches in one preorder (groups multiple batch orders under one PO)
+app.post('/api/orders/preorder', requireCustomer, async (req, res) => {
+  await db.read();
+  const { batches } = req.body; // [{ batchId, items }]
+  const phone = req.customerPhone;
+  const customer = req.customer;
+  if (!batches?.length) return res.status(400).json({ error: 'No batches provided' });
+
+  // Validate all batches first
+  for (const b of batches) {
+    const batch = db.data.batches.find(x => x.id === b.batchId);
+    if (!batch) return res.status(404).json({ error: 'Batch not found: ' + b.batchId });
+    if (batch.status !== 'active') return res.status(400).json({ error: batch.ref + ' is no longer active.' });
+    const dup = db.data.orders.find(o => o.phone === phone && o.batchId === b.batchId);
+    if (dup) return res.status(400).json({ error: 'You already ordered from ' + batch.ref });
+  }
+
+  // Generate single PO number for all batches
+  const poNumber = generatePONumber(db.data.poCounter);
+  const createdAt = new Date().toISOString();
+  const refs = [];
+
+  for (let i = 0; i < batches.length; i++) {
+    const { batchId, items } = batches[i];
+    const batch = db.data.batches.find(x => x.id === batchId);
+    const ref = poNumber + (batches.length > 1 ? String.fromCharCode(65 + i) : '');
+    db.data.orders.push({
+      ref, poNumber, batchId,
+      batchTitle: batch.title, batchRef: batch.ref,
+      customerId: customer.id, phone,
+      customerName: `${customer.firstName} ${customer.lastName}`,
+      items, createdAt,
+    });
+    refs.push(ref);
+  }
+
+  await db.write();
+  console.log(`New preorder: ${poNumber} (${refs.length} batches) — ${customer.firstName} ${customer.lastName}`);
+  res.json({ success: true, poNumber, refs });
 });
 
 // ── IMAGE UPLOAD ──────────────────────────────────────────
@@ -392,8 +481,34 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   const { batchId } = req.query;
   let orders = db.data.orders;
   if (batchId) orders = orders.filter(o => o.batchId === batchId);
-  orders = [...orders].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  res.json({ orders });
+
+  // Group orders by PO number
+  const poMap = {};
+  orders.forEach(o => {
+    const po = o.poNumber || o.ref; // fallback for old orders without poNumber
+    if (!poMap[po]) {
+      poMap[po] = {
+        poNumber: po,
+        customerName: o.customerName,
+        phone: o.phone,
+        createdAt: o.createdAt,
+        batchOrders: [],
+      };
+    }
+    poMap[po].batchOrders.push({
+      ref: o.ref,
+      batchId: o.batchId,
+      batchTitle: o.batchTitle,
+      batchRef: o.batchRef,
+      items: o.items,
+    });
+  });
+
+  // Sort by date descending
+  const preorders = Object.values(poMap)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  res.json({ orders, preorders });
 });
 
 // ── ADMIN: CUSTOMERS ──────────────────────────────────────
