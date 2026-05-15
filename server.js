@@ -536,6 +536,71 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   res.json({ orders, preorders });
 });
 
+// ── DEPOSIT SCREENSHOT UPLOAD ────────────────────────────
+app.post('/api/orders/:poNumber/deposit', requireCustomer, async (req, res) => {
+  await db.read();
+  const { poNumber } = req.params;
+  const { imageData, fileName } = req.body;
+  if (!imageData || !fileName) return res.status(400).json({ error: 'No image provided' });
+
+  // Verify this PO belongs to this customer
+  const orders = db.data.orders.filter(o => o.poNumber === poNumber && o.phone === req.customerPhone);
+  if (!orders.length) return res.status(404).json({ error: 'Order not found' });
+
+  if (orders[0].depositStatus === 'confirmed') {
+    return res.status(400).json({ error: 'Deposit already confirmed' });
+  }
+
+  // Save image
+  const matches = imageData.match(/^data:([A-Za-z-+/]+);base64,(.+)$/);
+  if (!matches) return res.status(400).json({ error: 'Invalid image format' });
+  const ext = matches[1].split('/')[1].replace('jpeg','jpg');
+  const allowed = ['jpg','jpeg','png','webp'];
+  if (!allowed.includes(ext)) return res.status(400).json({ error: 'Only JPG/PNG images allowed' });
+
+  const uniqueName = 'deposit_' + Date.now() + '_' + Math.random().toString(36).slice(2,7) + '.' + ext;
+  const filePath = path.join(IMAGES_DIR, uniqueName);
+  await writeFile(filePath, Buffer.from(matches[2], 'base64'));
+  const imageUrl = '/images/' + uniqueName;
+
+  // Update all orders under this PO
+  db.data.orders.forEach(o => {
+    if (o.poNumber === poNumber && o.phone === req.customerPhone) {
+      o.depositStatus = 'pending';
+      o.depositImage = imageUrl;
+      o.depositSubmittedAt = new Date().toISOString();
+      o.depositNote = null;
+    }
+  });
+  await db.write();
+  console.log('Deposit submitted for PO:', poNumber);
+  res.json({ success: true, imageUrl });
+});
+
+// ── ADMIN: VERIFY DEPOSIT ────────────────────────────────
+app.post('/api/admin/orders/:poNumber/deposit-verify', requireAdmin, async (req, res) => {
+  await db.read();
+  const { poNumber } = req.params;
+  const { action, note } = req.body;
+  const orders = db.data.orders.filter(o => o.poNumber === poNumber);
+  if (!orders.length) return res.status(404).json({ error: 'Order not found' });
+
+  orders.forEach(o => {
+    if (action === 'confirm') {
+      o.depositStatus = 'confirmed';
+      o.depositVerifiedAt = new Date().toISOString();
+      o.depositNote = null;
+    } else {
+      o.depositStatus = 'rejected';
+      o.depositNote = note || 'Unclear image';
+      o.depositVerifiedAt = new Date().toISOString();
+    }
+  });
+  await db.write();
+  console.log('Deposit', action + 'ed for PO:', poNumber);
+  res.json({ success: true });
+});
+
 // ── ADMIN: DELETE ORDER ─────────────────────────
 app.delete('/api/admin/orders/:poNumber', requireAdmin, async (req, res) => {
   await db.read();
