@@ -259,7 +259,20 @@ app.get('/api/orders/my', requireCustomer, async (req, res) => {
         poNumber: o.poNumber || o.ref,
         createdAt: o.createdAt,
         batchOrders: [],
+        // Deposit fields from first order record
+        depositStatus: o.depositStatus || 'unpaid',
+        depositImage: o.depositImage || null,
+        depositNote: o.depositNote || null,
+        depositSubmittedAt: o.depositSubmittedAt || null,
       };
+    } else {
+      // Update deposit info if this order has newer deposit data
+      if (o.depositStatus) {
+        poMap[po].depositStatus = o.depositStatus;
+        poMap[po].depositImage = o.depositImage || poMap[po].depositImage;
+        poMap[po].depositNote = o.depositNote || poMap[po].depositNote;
+        poMap[po].depositSubmittedAt = o.depositSubmittedAt || poMap[po].depositSubmittedAt;
+      }
     }
     poMap[po].batchOrders.push({
       ref: o.ref,
